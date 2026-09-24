@@ -1,0 +1,21 @@
+build/
+dist/
+config.json
+auto_task_state.json
+*.log
+close_trace.log
+FzwyHook.cfg
+FzwyHook_*.dll
+storage-dump-*.json
+.workbuddy-ai/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE / OS
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store

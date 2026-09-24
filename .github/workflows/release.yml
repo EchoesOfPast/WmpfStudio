@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.3'
+          arch: win64_mingw
+          modules: 'qtwebsockets'
+          tools: 'tools_mingw1310'
+
+      - name: Configure
+        shell: bash
+        run: |
+          # The runner's own MinGW (C:/mingw64, gcc 15) is ABI-incompatible with
+          # Qt's mingw_64 build; Qt's bundled 13.1 must be used explicitly.
+          QTBIN=$(dirname "$(which qmake)")
+          QTROOT=$(cd "$QTBIN/../../.." && pwd)
+          MINGW_BIN=$(ls -d "$QTROOT"/Tools/mingw*/bin | head -1)
+          echo "MINGW_BIN=$MINGW_BIN"
+          "$MINGW_BIN/g++.exe" --version | head -1
+          cmake -G "MinGW Makefiles" \
+            -DCMAKE_PREFIX_PATH="$QTBIN/.." \
+            -DCMAKE_C_COMPILER="$MINGW_BIN/gcc.exe" \
+            -DCMAKE_CXX_COMPILER="$MINGW_BIN/g++.exe" \
+            -DFZWY_VERSION="${GITHUB_REF_NAME#v}" \
+            -S . -B build
+
+      - name: Build + deploy
+        shell: bash
+        run: |
+          cmake --build build --config Release -j2
+          cmake --build build --target deploy
+
+      - name: Smoke self-check
+        shell: bash
+        run: |
+          cd build
+          ./WmpfStudio.exe --screenshot studio.png
+          test -s studio.png
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'stop'
+          Compress-Archive -Path "dist/WmpfStudio" -DestinationPath "WmpfStudio-$env:GITHUB_REF_NAME-windows-x64.zip" -Force
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: WmpfStudio ${{ github.ref_name }}
+          generate_release_notes: true
+          files: WmpfStudio-${{ github.ref_name }}-windows-x64.zip
