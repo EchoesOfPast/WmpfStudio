@@ -31,7 +31,8 @@ private slots:
 private:
     void buildUi();
     void setBusy(bool busy, const QString &label);
-    // kind: 0=start channel, 1=refresh pages, 2=eval, 3=export storage
+    // kind: 0=start channel, 1=refresh pages, 2=eval, 3=export storage,
+    //       4=scan local packages, 5=decrypt+unpack all
     void startJob(int kind, const QString &expr = {});
     QString pagePattern() const;
 
@@ -50,4 +51,8 @@ private:
     QPushButton *m_btnStorage = nullptr;
     QLabel *m_status = nullptr;
     QTextEdit *m_console = nullptr;
+
+    QLineEdit *m_appId = nullptr;
+    QPushButton *m_btnScan = nullptr;
+    QPushButton *m_btnUnpack = nullptr;
 };

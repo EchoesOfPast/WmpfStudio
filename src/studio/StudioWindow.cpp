@@ -4,15 +4,19 @@
 #include <QCloseEvent>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QLocale>
 #include <QMessageBox>
 #include <QVBoxLayout>
 
 #include "../CdpClient.h"
+#include "../WxPkg.h"
 
 namespace {
 const char *kStyle = R"CSS(
@@ -60,6 +64,46 @@ const char *kStorageJs = R"JS(
   return JSON.stringify(o);
 })()
 )JS";
+
+// One cached mini-program package found on disk.
+struct LocalPkg {
+    QString appId;
+    QString version;
+    QString path;
+    qint64 size = 0;
+};
+
+// Enumerate %APPDATA%/Tencent/xwechat/radium/users/<hash>/applet/packages/
+// <appId>/<version>/*.wxapkg. Empty appIdFilter scans every appId directory;
+// the appId of each package is inferred from the directory name.
+QList<LocalPkg> scanLocalPkgs(const QString &appIdFilter) {
+    QList<LocalPkg> out;
+    const QString root =
+        qEnvironmentVariable("APPDATA") + QStringLiteral("/Tencent/xwechat/radium/users");
+    const QDir usersDir(root);
+    const QStringList users = usersDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &user : users) {
+        const QString pkgsRoot = root + QLatin1Char('/') + user + QStringLiteral("/applet/packages");
+        const QDir pkgsDir(pkgsRoot);
+        const QStringList appIds =
+            appIdFilter.isEmpty()
+                ? pkgsDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)
+                : QStringList{appIdFilter};
+        for (const QString &aid : appIds) {
+            const QDir aidDir(pkgsRoot + QLatin1Char('/') + aid);
+            const QStringList versions =
+                aidDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+            for (const QString &ver : versions) {
+                const QDir verDir(aidDir.filePath(ver));
+                const QFileInfoList files =
+                    verDir.entryInfoList({QStringLiteral("*.wxapkg")}, QDir::Files, QDir::Name);
+                for (const QFileInfo &fi : files)
+                    out.push_back({aid, ver, fi.absoluteFilePath(), fi.size()});
+            }
+        }
+    }
+    return out;
+}
 }  // namespace
 
 StudioWindow::StudioWindow() {
@@ -126,6 +170,31 @@ void StudioWindow::buildUi() {
     cl->addLayout(r2);
     lay->addWidget(card);
 
+    auto *pkgCard = new QFrame;
+    pkgCard->setObjectName(QStringLiteral("card"));
+    auto *pl = new QVBoxLayout(pkgCard);
+    pl->setContentsMargins(12, 10, 12, 10);
+    pl->setSpacing(6);
+
+    auto *pr = new QHBoxLayout;
+    pr->setSpacing(8);
+    auto *pkgLabel = new QLabel(QStringLiteral("离线解包"));
+    pr->addWidget(pkgLabel);
+    m_appId = new QLineEdit;
+    m_appId->setPlaceholderText(QStringLiteral("小程序 appId（如 wx3130e983e955b53e）"));
+    pr->addWidget(m_appId, 1);
+    m_btnScan = new QPushButton(QStringLiteral("扫描本地包"));
+    m_btnScan->setObjectName(QStringLiteral("ghost"));
+    m_btnScan->setCursor(Qt::PointingHandCursor);
+    connect(m_btnScan, &QPushButton::clicked, this, [this] { startJob(4); });
+    pr->addWidget(m_btnScan);
+    m_btnUnpack = new QPushButton(QStringLiteral("解包全部"));
+    m_btnUnpack->setCursor(Qt::PointingHandCursor);
+    connect(m_btnUnpack, &QPushButton::clicked, this, [this] { startJob(5); });
+    pr->addWidget(m_btnUnpack);
+    pl->addLayout(pr);
+    lay->addWidget(pkgCard);
+
     m_console = new QTextEdit;
     m_console->setReadOnly(true);
     m_console->document()->setMaximumBlockCount(10000);
@@ -163,6 +232,8 @@ void StudioWindow::setBusy(bool busy, const QString &label) {
     m_btnPages->setEnabled(!busy);
     m_btnRun->setEnabled(!busy);
     m_btnStorage->setEnabled(!busy);
+    m_btnScan->setEnabled(!busy);
+    m_btnUnpack->setEnabled(!busy);
     m_status->setText(label);
 }
 
@@ -186,10 +257,16 @@ void StudioWindow::startJob(int kind, const QString &expr) {
         return;
     if (kind == 2 && expr.trimmed().isEmpty())
         return;
-    const QString label = kind == 0 ? QStringLiteral("正在启动通道…")
-                                    : (kind == 1 ? QStringLiteral("正在刷新页面…")
-                                                 : (kind == 2 ? QStringLiteral("正在执行…")
-                                                              : QStringLiteral("正在导出 Storage…")));
+    QString label;
+    switch (kind) {
+    case 0: label = QStringLiteral("正在启动通道…"); break;
+    case 1: label = QStringLiteral("正在刷新页面…"); break;
+    case 2: label = QStringLiteral("正在执行…"); break;
+    case 3: label = QStringLiteral("正在导出 Storage…"); break;
+    case 4: label = QStringLiteral("正在扫描本地包…"); break;
+    case 5: label = QStringLiteral("正在离线解包…"); break;
+    default: return;
+    }
     setBusy(true, label);
 
     m_log = [this](const QString &m) {
@@ -202,7 +279,8 @@ void StudioWindow::startJob(int kind, const QString &expr) {
 
     auto alive = m_alive;
     const QString pattern = pagePattern();
-    auto *job = new JobThread([this, kind, expr, pattern, alive] {
+    const QString appId = m_appId->text().trimmed();
+    auto *job = new JobThread([this, kind, expr, pattern, appId, alive] {
         QStringList pages;
         if (kind == 0) {
             const bool ok = m_chan.ensure();
@@ -285,6 +363,66 @@ void StudioWindow::startJob(int kind, const QString &expr) {
                         appendLog(QStringLiteral("导出失败：%1").arg(err));
                     },
                     Qt::QueuedConnection);
+            }
+        } else if (kind == 4 || kind == 5) {
+            const QList<LocalPkg> pkgs = scanLocalPkgs(appId);
+            if (pkgs.isEmpty()) {
+                m_log(appId.isEmpty()
+                          ? QStringLiteral("未找到任何本地包（确认 %APPDATA%/Tencent/xwechat/"
+                                           "radium 下存在 packages 缓存）")
+                          : QStringLiteral("未找到 appId %1 的本地包").arg(appId));
+            } else if (kind == 4) {
+                m_log(QStringLiteral("找到 %1 个本地包：").arg(pkgs.size()));
+                QString lastKey;
+                for (const LocalPkg &p : pkgs) {
+                    const QString key = p.appId + QLatin1Char('/') + p.version;
+                    if (key != lastKey) {
+                        m_log(QStringLiteral("  %1 版本目录 %2").arg(p.appId, p.version));
+                        lastKey = key;
+                    }
+                    m_log(QStringLiteral("    %1  %2")
+                              .arg(QFileInfo(p.path).fileName(),
+                                   QLocale().formattedDataSize(p.size)));
+                }
+                m_log(QStringLiteral("提示：appId 留空时按目录名自动推断"));
+            } else {
+                const QString outRoot = QCoreApplication::applicationDirPath() +
+                                        QStringLiteral("/unpacked");
+                m_log(QStringLiteral("开始解包 %1 个包，输出目录 %2").arg(pkgs.size()).arg(outRoot));
+                int okCount = 0;
+                int failCount = 0;
+                for (const LocalPkg &p : pkgs) {
+                    const QString pkgName = QFileInfo(p.path).completeBaseName();
+                    QString err;
+                    const QByteArray plain = WxPkg::decryptFile(p.path, p.appId, &err);
+                    if (plain.isEmpty()) {
+                        m_log(QStringLiteral("  解密失败 %1/%2/%3：%4")
+                                  .arg(p.appId, p.version, pkgName, err));
+                        ++failCount;
+                        continue;
+                    }
+                    const QString outDir = outRoot + QLatin1Char('/') + p.appId +
+                                           QLatin1Char('/') + p.version + QLatin1Char('/') +
+                                           pkgName;
+                    err.clear();
+                    const int n = WxPkg::unpackToDir(plain, outDir, &err);
+                    if (n < 0) {
+                        m_log(QStringLiteral("  解包失败 %1/%2/%3：%4")
+                                  .arg(p.appId, p.version, pkgName, err));
+                        ++failCount;
+                        continue;
+                    }
+                    m_log(QStringLiteral("  %1/%2/%3 写出 %4 个文件 → %5")
+                              .arg(p.appId, p.version, pkgName)
+                              .arg(n)
+                              .arg(outDir));
+                    if (!err.isEmpty())
+                        m_log(QStringLiteral("    警告：%1").arg(err));
+                    ++okCount;
+                }
+                m_log(QStringLiteral("离线解包完成：成功 %1 个，失败 %2 个")
+                          .arg(okCount)
+                          .arg(failCount));
             }
         }
         const QString doneLabel = kind == 0 ? QStringLiteral("通道运行中") : QStringLiteral("就绪");

@@ -79,6 +79,8 @@ add_executable(WmpfStudio WIN32
     src/Config.h
     src/Config.cpp
     src/JobThread.h
+    src/WxPkg.h
+    src/WxPkg.cpp
     ${WMPF_SOURCES}
     res/app.qrc
     ${CMAKE_CURRENT_BINARY_DIR}/wmpf_offsets.qrc
@@ -92,6 +94,7 @@ target_link_libraries(WmpfStudio PRIVATE
     Qt6::Widgets
     Qt6::Network
     Qt6::WebSockets
+    bcrypt
 )
 
 # Deploy: Qt6 runtime + MinGW runtime.
