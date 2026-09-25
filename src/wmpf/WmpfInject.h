@@ -40,4 +40,15 @@ QString hookLogTail(int lines = 25);
 // Returns the number of processes that were successfully commanded.
 int unhookAll(const std::function<void(const QString &)> &log = {});
 
+// PID of the main WeChatAppEx host process (same pickMainProcess strategy as
+// installHook); 0 when no WeChatAppEx process exists. Public for the memory
+// instrument (FxInstrument) attach path.
+quint32 pickMainHostPid();
+
+// All loaded FzwyHook*.dll file names in the target process (e.g.
+// "FzwyHook_ab12cd34ef56.dll"). Multiple variants may coexist; callers that
+// command or attach to a DLL must pick precisely (see the note at the
+// implementation). Public for the memory instrument attach path.
+QStringList loadedHookDllNames(quint32 pid);
+
 }  // namespace wmpf

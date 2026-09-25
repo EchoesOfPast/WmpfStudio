@@ -68,6 +68,8 @@ set(WMPF_SOURCES
     src/wmpf/WmpfChannel.cpp
     src/wmpf/WmpfSession.h
     src/wmpf/WmpfSession.cpp
+    src/wmpf/FxInstrument.h
+    src/wmpf/FxInstrument.cpp
 )
 
 add_executable(WmpfStudio WIN32

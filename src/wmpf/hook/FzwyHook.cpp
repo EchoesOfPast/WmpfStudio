@@ -617,12 +617,451 @@ void signalReady() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Memory-instrument IPC channel.
+//
+// Upgrades this DLL from a "patch" into an "instrument": any process on the
+// same machine can read/write/scan the host's memory, enumerate its modules
+// and exports, and call functions in it, via a 64KB shared-memory block plus
+// two named auto-reset events. Named with the same pid_dllBaseName style as
+// FzwyHookReady, so multiple coexisting DLL variants each get their own channel.
+//
+// The channel is brought up independently of doInstall(): even when hook
+// installation fails (e.g. the host is not WeChat), the instrument stays alive.
+//
+// SAFETY: MinGW x64 has no MSVC SEH (__try/__except), so every access to a
+// client-supplied address is pre-checked with VirtualQuery / VirtualProtect
+// and copied through local buffers — the shared memory is never used as a
+// source/destination for target address content directly. A failed op sets a
+// negative status; nothing here may crash the host.
+// ---------------------------------------------------------------------------
+
+HMODULE g_selfModule = nullptr;  // own module handle (FxExports fallback module)
+
+constexpr uint32_t kFxReqMagic = 0x46585251u;   // 'FXRQ'
+constexpr uint32_t kFxRespMagic = 0x46585253u;  // 'FXRS'
+constexpr size_t kFxShmSize = 64 * 1024;
+constexpr size_t kFxReqPayloadOff = 4096;
+constexpr size_t kFxReqPayloadCap = 4096;  // [4096..8192)
+constexpr size_t kFxRespHdrOff = 8192;
+constexpr size_t kFxRespPayloadOff = 8224;
+constexpr size_t kFxRespPayloadCap = kFxShmSize - kFxRespPayloadOff;  // ~55KB
+
+// Request header at SHM [0..36). Packed so both sides agree on the layout
+// regardless of compiler alignment choices.
+#pragma pack(push, 1)
+struct FxReqHdr {
+    uint32_t magic;  // kFxReqMagic
+    uint32_t op;
+    uint64_t addr;   // address / scan start / function pointer / module base unused
+    uint64_t arg2;   // read: length; write: length; scan: range length
+    uint64_t arg3;   // exports: module base (0 = flue.dll/self); scan: pattern length
+    uint32_t reserved;
+};
+// Response header at SHM [8192..8216); payload at [8224..65536).
+struct FxRespHdr {
+    uint32_t magic;  // kFxRespMagic
+    int32_t status;  // 0 ok; 1 not found (scan); -1 bad/unreadable memory; -2 bad argument
+    uint64_t value;  // read: echo addr; scan: hit; call: return value
+    uint32_t outLen; // valid bytes in response payload
+    uint32_t reserved;
+};
+#pragma pack(pop)
+static_assert(sizeof(FxReqHdr) == 36, "FxReqHdr layout");
+static_assert(sizeof(FxRespHdr) == 24, "FxRespHdr layout");
+
+enum FxOp : uint32_t {
+    kFxOpRead = 1,
+    kFxOpWrite = 2,
+    kFxOpModules = 3,
+    kFxOpExports = 4,
+    kFxOpScan = 5,
+    kFxOpCall = 6,
+};
+
+struct FxChannel {
+    HANDLE mapping = nullptr;
+    uint8_t *view = nullptr;
+    HANDLE reqEv = nullptr;
+    HANDLE respEv = nullptr;
+};
+FxChannel g_fx;
+
+bool fxReadableProtect(DWORD prot) {
+    if (prot & (PAGE_GUARD | PAGE_NOACCESS))
+        return false;
+    const DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (prot & ok) != 0;
+}
+
+bool fxWritableProtect(DWORD prot) {
+    if (prot & (PAGE_GUARD | PAGE_NOACCESS))
+        return false;
+    const DWORD ok =
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (prot & ok) != 0;
+}
+
+// Copy [src, src+n) to dst, validating region-by-region with VirtualQuery.
+// Returns false at the first unreadable byte (no partial success reported).
+bool fxSafeRead(uint64_t src, size_t n, uint8_t *dst) {
+    if (src + n < src)  // address wrap
+        return false;
+    size_t done = 0;
+    while (done < n) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(src + done), &mbi, sizeof(mbi)) == 0)
+            return false;
+        if (mbi.State != MEM_COMMIT || !fxReadableProtect(mbi.Protect))
+            return false;
+        const auto cur = reinterpret_cast<const uint8_t *>(src + done);
+        const size_t offset = size_t(cur - reinterpret_cast<const uint8_t *>(mbi.BaseAddress));
+        const size_t avail = mbi.RegionSize - offset;
+        const size_t chunk = avail < n - done ? avail : n - done;
+        memcpy(dst + done, cur, chunk);
+        done += chunk;
+    }
+    return true;
+}
+
+// Copy data[0..n) to [dstAddr, dstAddr+n). Regions not currently writable get a
+// temporary VirtualProtect to PAGE_READWRITE, restored afterwards.
+bool fxSafeWrite(uint64_t dstAddr, const uint8_t *data, size_t n) {
+    if (dstAddr + n < dstAddr)
+        return false;
+    size_t done = 0;
+    while (done < n) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(dstAddr + done), &mbi, sizeof(mbi)) == 0)
+            return false;
+        if (mbi.State != MEM_COMMIT)
+            return false;
+        DWORD oldProt = 0;
+        bool changed = false;
+        if (!fxWritableProtect(mbi.Protect)) {
+            if (!VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProt))
+                return false;
+            changed = true;
+        }
+        const auto cur = reinterpret_cast<uint8_t *>(dstAddr + done);
+        const size_t offset = size_t(cur - reinterpret_cast<uint8_t *>(mbi.BaseAddress));
+        const size_t avail = mbi.RegionSize - offset;
+        const size_t chunk = avail < n - done ? avail : n - done;
+        memcpy(cur, data + done, chunk);
+        if (changed)
+            VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &oldProt);
+        done += chunk;
+    }
+    // In case the write patched code, keep the CPU's view coherent.
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<LPCVOID>(dstAddr), n);
+    return true;
+}
+
+bool fxSetup() {
+    const DWORD pid = GetCurrentProcessId();
+    wchar_t name[160];
+    swprintf(name, 160, L"FxIpcShm_%lu_%ls", pid, g_dllBaseName.c_str());
+    g_fx.mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                      DWORD(kFxShmSize), name);
+    if (!g_fx.mapping) {
+        logLine("内存仪器：CreateFileMapping 失败 %lu", GetLastError());
+        return false;
+    }
+    g_fx.view = static_cast<uint8_t *>(
+        MapViewOfFile(g_fx.mapping, FILE_MAP_ALL_ACCESS, 0, 0, kFxShmSize));
+    if (!g_fx.view) {
+        logLine("内存仪器：MapViewOfFile 失败 %lu", GetLastError());
+        return false;
+    }
+    memset(g_fx.view, 0, kFxShmSize);
+    swprintf(name, 160, L"FxIpcReq_%lu_%ls", pid, g_dllBaseName.c_str());
+    g_fx.reqEv = CreateEventW(nullptr, FALSE, FALSE, name);  // auto-reset
+    swprintf(name, 160, L"FxIpcResp_%lu_%ls", pid, g_dllBaseName.c_str());
+    g_fx.respEv = CreateEventW(nullptr, FALSE, FALSE, name);  // auto-reset
+    if (!g_fx.reqEv || !g_fx.respEv) {
+        logLine("内存仪器：CreateEvent 失败 %lu", GetLastError());
+        return false;
+    }
+    logLine("内存仪器通道就绪：FxIpc*_%lu_%ls", pid, g_dllBaseName.c_str());
+    return true;
+}
+
+void fxModules(std::string *text, int32_t *status) {
+    HANDLE snap =
+        CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) {
+        *status = -1;
+        return;
+    }
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    char line[600];
+    if (Module32FirstW(snap, &me)) {
+        do {
+            char name[256] = {};
+            WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1, name, sizeof(name) - 1, nullptr,
+                                nullptr);
+            const int n =
+                snprintf(line, sizeof(line), "%s\t0x%llX\t%lu\n", name,
+                         (unsigned long long)reinterpret_cast<uint64_t>(me.modBaseAddr),
+                         (unsigned long)me.modBaseSize);
+            if (n > 0)
+                text->append(line, size_t(n));
+        } while (Module32NextW(snap, &me) && text->size() < kFxRespPayloadCap);
+    }
+    CloseHandle(snap);
+}
+
+void fxExports(uint64_t base, std::string *text, int32_t *status) {
+    if (!base) {
+        HMODULE m = GetModuleHandleW(L"flue.dll");
+        if (!m)
+            m = g_selfModule;
+        base = reinterpret_cast<uint64_t>(m);
+    }
+    // Walk the PE export directory by hand; every struct is copied out through
+    // fxSafeRead first (no raw dereference of unchecked addresses).
+    IMAGE_DOS_HEADER dh{};
+    if (!fxSafeRead(base, sizeof(dh), reinterpret_cast<uint8_t *>(&dh)) ||
+        dh.e_magic != IMAGE_DOS_SIGNATURE) {
+        *status = -1;
+        return;
+    }
+    IMAGE_NT_HEADERS64 nt{};
+    if (!fxSafeRead(base + uint64_t(dh.e_lfanew), sizeof(nt), reinterpret_cast<uint8_t *>(&nt)) ||
+        nt.Signature != IMAGE_NT_SIGNATURE ||
+        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        *status = -1;
+        return;
+    }
+    const IMAGE_DATA_DIRECTORY dir =
+        nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size)
+        return;  // no export table: success with empty output
+    IMAGE_EXPORT_DIRECTORY ed{};
+    if (!fxSafeRead(base + dir.VirtualAddress, sizeof(ed), reinterpret_cast<uint8_t *>(&ed))) {
+        *status = -1;
+        return;
+    }
+    char line[320];
+    for (DWORD i = 0; i < ed.NumberOfNames && text->size() < kFxRespPayloadCap; ++i) {
+        DWORD nameRva = 0;
+        if (!fxSafeRead(base + uint64_t(ed.AddressOfNames) + 4ull * i, sizeof(nameRva),
+                        reinterpret_cast<uint8_t *>(&nameRva)))
+            break;
+        char nameBuf[256] = {};
+        if (!fxSafeRead(base + nameRva, sizeof(nameBuf) - 1, reinterpret_cast<uint8_t *>(nameBuf)))
+            continue;  // skip this entry, keep going
+        nameBuf[sizeof(nameBuf) - 1] = 0;
+        // Sanitize: keep printable chars only.
+        for (char *p = nameBuf; *p; ++p) {
+            if (*p < 32 || *p > 126) {
+                *p = 0;
+                break;
+            }
+        }
+        if (!nameBuf[0])
+            continue;
+        WORD ord = 0;
+        if (!fxSafeRead(base + uint64_t(ed.AddressOfNameOrdinals) + 2ull * i, sizeof(ord),
+                        reinterpret_cast<uint8_t *>(&ord)) ||
+            ord >= ed.NumberOfFunctions)
+            continue;
+        DWORD funcRva = 0;
+        if (!fxSafeRead(base + uint64_t(ed.AddressOfFunctions) + 4ull * ord, sizeof(funcRva),
+                        reinterpret_cast<uint8_t *>(&funcRva)))
+            continue;
+        const int n = snprintf(line, sizeof(line), "%s\t0x%llX\n", nameBuf,
+                               (unsigned long long)(base + funcRva));
+        if (n > 0)
+            text->append(line, size_t(n));
+    }
+}
+
+// Scan [start, start+length) for pattern bytes; mask chars: '?' = wildcard, else exact.
+// Unreadable/reserved regions are skipped, not fatal. status: 0 hit, 1 miss.
+void fxScan(uint64_t start, uint64_t length, const uint8_t *pat, const char *mask, size_t plen,
+            uint64_t *hit, int32_t *status) {
+    *status = 1;
+    *hit = 0;
+    const uint64_t end = start + length;
+    constexpr size_t kBlock = 0x10000;
+    std::vector<uint8_t> buf(kBlock);
+    std::vector<uint8_t> tail;  // last plen-1 bytes of the previous block (overlap)
+    tail.reserve(plen > 0 ? plen - 1 : 0);
+    uint64_t cur = start;
+    while (cur < end && *status == 1) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0) {
+            // Below-64K null region etc.: hop to the next allocation boundary.
+            cur = (cur + 0x10000) & ~uint64_t(0xFFFF);
+            continue;
+        }
+        const uint64_t regionEnd = uint64_t(reinterpret_cast<uint64_t>(mbi.BaseAddress) +
+                                            uint64_t(mbi.RegionSize));
+        uint64_t rEnd = regionEnd < end ? regionEnd : end;
+        if (rEnd <= cur) {  // guarantee forward progress
+            cur = cur + 1;
+            continue;
+        }
+        if (mbi.State != MEM_COMMIT || !fxReadableProtect(mbi.Protect)) {
+            cur = rEnd;
+            continue;
+        }
+        uint64_t pos = cur;
+        tail.clear();
+        while (pos < rEnd && *status == 1) {
+            const size_t want =
+                size_t(rEnd - pos < uint64_t(kBlock) ? rEnd - pos : uint64_t(kBlock));
+            if (!fxSafeRead(pos, want, buf.data()))
+                break;  // region changed under us; move on to the next one
+            // Search window = tail of previous block + this block.
+            std::vector<uint8_t> win(tail.begin(), tail.end());
+            const uint64_t winBase = pos - tail.size();
+            win.insert(win.end(), buf.begin(), buf.begin() + want);
+            for (size_t i = 0; i + plen <= win.size(); ++i) {
+                bool m = true;
+                for (size_t j = 0; j < plen; ++j) {
+                    if (mask[j] != '?' && win[i + j] != pat[j]) {
+                        m = false;
+                        break;
+                    }
+                }
+                if (m) {
+                    *hit = winBase + i;
+                    *status = 0;
+                    break;
+                }
+            }
+            if (want >= plen - 1)
+                tail.assign(buf.begin() + (want - (plen - 1)), buf.begin() + want);
+            pos += want;
+        }
+        cur = rEnd;
+    }
+}
+
+void fxHandleRequest() {
+    // Snapshot the request header + payload into local buffers first: the client
+    // owns the SHM and could mutate it while we work.
+    FxReqHdr req{};
+    memcpy(&req, g_fx.view, sizeof(req));
+    if (req.magic != kFxReqMagic)
+        return;  // not a real request (shouldn't happen with an auto-reset event)
+    uint8_t reqPayload[kFxReqPayloadCap];
+    memcpy(reqPayload, g_fx.view + kFxReqPayloadOff, sizeof(reqPayload));
+
+    int32_t status = 0;
+    uint64_t value = 0;
+    std::string text;  // modules/exports output
+    std::vector<uint8_t> blob;  // read output
+
+    switch (req.op) {
+    case kFxOpRead: {
+        size_t len = size_t(req.arg2);
+        if (len == 0 || len > 0x10000 || !req.addr) {
+            status = -2;
+            break;
+        }
+        if (len > kFxRespPayloadCap)
+            len = kFxRespPayloadCap;  // response buffer is smaller than the max request
+        blob.resize(len);
+        if (!fxSafeRead(req.addr, len, blob.data())) {
+            blob.clear();
+            status = -1;
+            break;
+        }
+        value = req.addr;
+        break;
+    }
+    case kFxOpWrite: {
+        const size_t len = size_t(req.arg2);
+        if (len == 0 || len > kFxReqPayloadCap || !req.addr) {
+            status = -2;
+            break;
+        }
+        if (!fxSafeWrite(req.addr, reqPayload, len))
+            status = -1;
+        break;
+    }
+    case kFxOpModules:
+        fxModules(&text, &status);
+        break;
+    case kFxOpExports:
+        fxExports(req.arg3, &text, &status);
+        break;
+    case kFxOpScan: {
+        const size_t plen = size_t(req.arg3);
+        if (plen == 0 || plen > 256 || req.arg2 == 0 || req.arg2 > 0x4000000ull) {
+            status = -2;
+            break;
+        }
+        // Payload layout: pattern bytes [0..plen), then same-length mask string.
+        fxScan(req.addr, req.arg2, reqPayload, reinterpret_cast<const char *>(reqPayload) + plen,
+               plen, &value, &status);
+        break;
+    }
+    case kFxOpCall: {
+        if (!req.addr) {
+            status = -2;
+            break;
+        }
+        // Pre-check the entry point: must be committed + executable.
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(req.addr), &mbi, sizeof(mbi)) == 0 ||
+            mbi.State != MEM_COMMIT ||
+            !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                             PAGE_EXECUTE_WRITECOPY))) {
+            status = -1;
+            break;
+        }
+        // NOTE: calling an arbitrary pointer can crash the host process on its own —
+        // that is inherent to what this instrument is for, and the caller owns that
+        // risk. The x64 Windows ABI passes the first 4 integer args in rcx/rdx/r8/r9,
+        // matching this signature exactly.
+        uint64_t args[4];
+        memcpy(args, reqPayload, sizeof(args));
+        using Fn4 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t);
+        value = reinterpret_cast<Fn4>(uintptr_t(req.addr))(args[0], args[1], args[2], args[3]);
+        break;
+    }
+    default:
+        status = -2;
+        break;
+    }
+
+    // Publish the response: payload first, header last, then signal.
+    const uint8_t *outData = nullptr;
+    size_t outLen = 0;
+    if (!blob.empty()) {
+        outData = blob.data();
+        outLen = blob.size();
+    } else if (!text.empty()) {
+        outData = reinterpret_cast<const uint8_t *>(text.data());
+        outLen = text.size();
+    }
+    if (outLen > kFxRespPayloadCap)
+        outLen = kFxRespPayloadCap;
+    if (outLen)
+        memcpy(g_fx.view + kFxRespPayloadOff, outData, outLen);
+    FxRespHdr resp{};
+    resp.magic = kFxRespMagic;
+    resp.status = status;
+    resp.value = value;
+    resp.outLen = uint32_t(outLen);
+    memcpy(g_fx.view + kFxRespHdrOff, &resp, sizeof(resp));
+    if (g_fx.respEv)
+        SetEvent(g_fx.respEv);
+}
+
 // Persistent thread: install once, then wait for the injector's "reinstall" command.
 // Needed because when the DLL is already in the target process, LoadLibraryW only
 // increments the ref count and doesn't re-run DllMain, so re-hooking must go through
 // this command channel.
 DWORD WINAPI workerThread(LPVOID self) {
     auto *hSelf = static_cast<HMODULE>(self);
+    g_selfModule = hSelf;
 
     wchar_t dllPath[MAX_PATH] = {};
     GetModuleFileNameW(hSelf, dllPath, MAX_PATH);
@@ -650,7 +1089,15 @@ DWORD WINAPI workerThread(LPVOID self) {
     swprintf(unhookName, 128, L"FzwyHookUnhook_%lu_%ls", GetCurrentProcessId(),
              g_dllBaseName.c_str());
     HANDLE unhookEv = CreateEventW(nullptr, FALSE, FALSE, unhookName);
-    HANDLE waits[2] = {cmd, unhookEv};
+    // Bring up the memory-instrument channel here too: it must live independently
+    // of whether doInstall() later succeeds (a host that isn't WeChat can still be
+    // inspected). Its failure is logged but never fatal to the hook path.
+    HANDLE waits[3] = {cmd, unhookEv, nullptr};
+    DWORD waitN = 2;
+    if (fxSetup()) {
+        waits[2] = g_fx.reqEv;
+        waitN = 3;
+    }
 
     for (;;) {
         const int rc = doInstall();
@@ -665,7 +1112,7 @@ DWORD WINAPI workerThread(LPVOID self) {
         // Loop waiting for commands, periodically report stats (the hook path does no I/O, to avoid slowing/hanging WeChat)
         long lastEnter = -1, lastScene = -1;
         for (;;) {
-            const DWORD w = WaitForMultipleObjects(2, waits, FALSE, 2000);
+            const DWORD w = WaitForMultipleObjects(waitN, waits, FALSE, 2000);
             if (w == WAIT_OBJECT_0) {
                 logLine("收到重新安装命令");
                 // Clear the unhook lockout: the DLL is never FreeLibrary'd after unhook,
@@ -677,6 +1124,10 @@ DWORD WINAPI workerThread(LPVOID self) {
                 logLine("收到卸载命令");
                 unhookAll();
                 continue;  // keep waiting; don't fall through to doInstall (g_disabled makes it a no-op)
+            }
+            if (waitN == 3 && w == WAIT_OBJECT_0 + 2) {
+                fxHandleRequest();
+                continue;  // handle one request, then keep waiting
             }
             const long e = g_enterCount, s = g_scenePatched;
             if (e != lastEnter || s != lastScene) {

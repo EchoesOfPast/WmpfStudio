@@ -17,6 +17,8 @@
 
 #include "../CdpClient.h"
 #include "../WxPkg.h"
+#include "../wmpf/FxInstrument.h"
+#include "../wmpf/WmpfInject.h"
 
 namespace {
 const char *kStyle = R"CSS(
@@ -64,6 +66,70 @@ const char *kStorageJs = R"JS(
   return JSON.stringify(o);
 })()
 )JS";
+
+// Parse a hex number ("0x1A2B" or "1A2B"); empty string fails.
+bool parseHex(const QString &s, quint64 *out) {
+    QString t = s.trimmed();
+    if (t.startsWith(QLatin1String("0x"), Qt::CaseInsensitive))
+        t = t.mid(2);
+    if (t.isEmpty())
+        return false;
+    bool ok = false;
+    const quint64 v = t.toULongLong(&ok, 16);
+    if (ok)
+        *out = v;
+    return ok;
+}
+
+// Parse a hex byte string. Accepts spaced ("4D 5A ?? 00") and compact
+// ("4D5A??00") forms; "??"/"?" bytes become wildcards in the mask.
+bool parseHexPattern(const QString &s, QByteArray *pattern, QByteArray *mask) {
+    QString t = s;
+    t.remove(QLatin1Char(' '));
+    t.remove(QLatin1Char('\t'));
+    if (t.isEmpty() || t.size() % 2 != 0)
+        return false;
+    pattern->clear();
+    mask->clear();
+    for (int i = 0; i + 2 <= t.size(); i += 2) {
+        const QString tok = t.mid(i, 2);
+        if (tok == QLatin1String("??") || tok == QLatin1String("**")) {
+            pattern->append('\0');
+            mask->append('?');
+            continue;
+        }
+        bool ok = false;
+        const uint v = tok.toUInt(&ok, 16);
+        if (!ok)
+            return false;
+        pattern->append(char(v));
+        mask->append('x');
+    }
+    return !pattern->isEmpty();
+}
+
+// Hex dump for the log: 16 bytes per line, address prefix, ASCII gutter.
+QStringList hexDump(quint64 base, const QByteArray &data) {
+    QStringList lines;
+    for (int off = 0; off < data.size(); off += 16) {
+        const int n = qMin(16, int(data.size()) - off);
+        QString hex;
+        QString ascii;
+        for (int i = 0; i < n; ++i) {
+            const uchar b = uchar(data[off + i]);
+            hex += QStringLiteral("%1 ").arg(b, 2, 16, QLatin1Char('0'));
+            ascii += (b >= 32 && b <= 126) ? QLatin1Char(char(b)) : QLatin1Char('.');
+        }
+        while (hex.size() < 16 * 3)
+            hex += QLatin1Char(' ');
+        lines << QStringLiteral("0x%1  %2 %3")
+                     .arg(base + quint64(off), 16, 16, QLatin1Char('0'))
+                     .arg(hex, ascii);
+    }
+    if (lines.isEmpty())
+        lines << QStringLiteral("（0 字节）");
+    return lines;
+}
 
 // One cached mini-program package found on disk.
 struct LocalPkg {
@@ -119,8 +185,8 @@ StudioWindow::~StudioWindow() {
 
 void StudioWindow::buildUi() {
     setWindowTitle(QStringLiteral("WmpfStudio · 小程序调试台"));
-    resize(640, 560);
-    setMinimumSize(520, 460);
+    resize(760, 780);
+    setMinimumSize(620, 640);
     qApp->setStyleSheet(QString::fromLatin1(kStyle));
 
     auto *root = new QWidget(this);
@@ -195,6 +261,80 @@ void StudioWindow::buildUi() {
     pl->addLayout(pr);
     lay->addWidget(pkgCard);
 
+    // Memory instrument card: drives the FxInstrument IPC of FzwyHook.dll
+    // running inside the target WeChatAppEx process.
+    auto *fxCard = new QFrame;
+    fxCard->setObjectName(QStringLiteral("card"));
+    auto *fl = new QVBoxLayout(fxCard);
+    fl->setContentsMargins(12, 10, 12, 10);
+    fl->setSpacing(6);
+    const auto mkBtn = [this](QPushButton **btn, const QString &text, bool ghost, int kind) {
+        *btn = new QPushButton(text);
+        if (ghost)
+            (*btn)->setObjectName(QStringLiteral("ghost"));
+        (*btn)->setCursor(Qt::PointingHandCursor);
+        connect(*btn, &QPushButton::clicked, this, [this, kind] { startJob(kind); });
+    };
+
+    auto *fr1 = new QHBoxLayout;
+    fr1->setSpacing(8);
+    fr1->addWidget(new QLabel(QStringLiteral("内存仪器")));
+    m_fxAddr = new QLineEdit;
+    m_fxAddr->setPlaceholderText(QStringLiteral("地址（hex，如 0x7FF612340000）"));
+    fr1->addWidget(m_fxAddr, 2);
+    m_fxLen = new QLineEdit;
+    m_fxLen->setText(QStringLiteral("0x100"));
+    fr1->addWidget(m_fxLen, 1);
+    mkBtn(&m_btnFxRead, QStringLiteral("读取"), false, 6);
+    fr1->addWidget(m_btnFxRead);
+    fl->addLayout(fr1);
+
+    auto *fr2 = new QHBoxLayout;
+    fr2->setSpacing(8);
+    m_fxWriteVal = new QLineEdit;
+    m_fxWriteVal->setPlaceholderText(QStringLiteral("写入字节（hex 串，如 90 90 CC）"));
+    fr2->addWidget(m_fxWriteVal, 2);
+    mkBtn(&m_btnFxWrite, QStringLiteral("写入"), false, 7);
+    fr2->addWidget(m_btnFxWrite);
+    m_fxModule = new QLineEdit;
+    m_fxModule->setPlaceholderText(QStringLiteral("模块名（如 flue.dll；导出列表用，留空=默认）"));
+    fr2->addWidget(m_fxModule, 2);
+    mkBtn(&m_btnFxModules, QStringLiteral("模块列表"), true, 8);
+    fr2->addWidget(m_btnFxModules);
+    mkBtn(&m_btnFxExports, QStringLiteral("导出列表"), true, 9);
+    fr2->addWidget(m_btnFxExports);
+    fl->addLayout(fr2);
+
+    auto *fr3 = new QHBoxLayout;
+    fr3->setSpacing(8);
+    m_fxPattern = new QLineEdit;
+    m_fxPattern->setPlaceholderText(QStringLiteral("模式（hex 串，?? 通配，如 4D 5A ?? 00）"));
+    fr3->addWidget(m_fxPattern, 2);
+    m_fxScanStart = new QLineEdit;
+    m_fxScanStart->setPlaceholderText(QStringLiteral("起始地址（默认 0）"));
+    fr3->addWidget(m_fxScanStart, 1);
+    m_fxScanLen = new QLineEdit;
+    m_fxScanLen->setText(QStringLiteral("0x2000000"));
+    fr3->addWidget(m_fxScanLen, 1);
+    mkBtn(&m_btnFxScan, QStringLiteral("扫描"), false, 10);
+    fr3->addWidget(m_btnFxScan);
+    fl->addLayout(fr3);
+
+    auto *fr4 = new QHBoxLayout;
+    fr4->setSpacing(8);
+    m_fxCallAddr = new QLineEdit;
+    m_fxCallAddr->setPlaceholderText(QStringLiteral("函数地址（hex）——调用任意指针可能崩目标进程，谨慎使用"));
+    fr4->addWidget(m_fxCallAddr, 2);
+    for (int i = 0; i < 4; ++i) {
+        m_fxArgs[i] = new QLineEdit;
+        m_fxArgs[i]->setPlaceholderText(QStringLiteral("参数%1（hex，可空）").arg(i));
+        fr4->addWidget(m_fxArgs[i], 1);
+    }
+    mkBtn(&m_btnFxCall, QStringLiteral("调用"), false, 11);
+    fr4->addWidget(m_btnFxCall);
+    fl->addLayout(fr4);
+    lay->addWidget(fxCard);
+
     m_console = new QTextEdit;
     m_console->setReadOnly(true);
     m_console->document()->setMaximumBlockCount(10000);
@@ -234,6 +374,12 @@ void StudioWindow::setBusy(bool busy, const QString &label) {
     m_btnStorage->setEnabled(!busy);
     m_btnScan->setEnabled(!busy);
     m_btnUnpack->setEnabled(!busy);
+    m_btnFxRead->setEnabled(!busy);
+    m_btnFxWrite->setEnabled(!busy);
+    m_btnFxModules->setEnabled(!busy);
+    m_btnFxExports->setEnabled(!busy);
+    m_btnFxScan->setEnabled(!busy);
+    m_btnFxCall->setEnabled(!busy);
     m_status->setText(label);
 }
 
@@ -257,6 +403,14 @@ void StudioWindow::startJob(int kind, const QString &expr) {
         return;
     if (kind == 2 && expr.trimmed().isEmpty())
         return;
+    if (kind == 6) {
+        // The read needs an address up front; fail fast before spawning a thread.
+        quint64 addr = 0;
+        if (!parseHex(m_fxAddr->text(), &addr)) {
+            appendLog(QStringLiteral("内存仪器：地址格式不对（hex，如 0x7FF612340000）"));
+            return;
+        }
+    }
     QString label;
     switch (kind) {
     case 0: label = QStringLiteral("正在启动通道…"); break;
@@ -265,6 +419,12 @@ void StudioWindow::startJob(int kind, const QString &expr) {
     case 3: label = QStringLiteral("正在导出 Storage…"); break;
     case 4: label = QStringLiteral("正在扫描本地包…"); break;
     case 5: label = QStringLiteral("正在离线解包…"); break;
+    case 6: label = QStringLiteral("正在读取目标内存…"); break;
+    case 7: label = QStringLiteral("正在写入目标内存…"); break;
+    case 8: label = QStringLiteral("正在枚举模块…"); break;
+    case 9: label = QStringLiteral("正在解析导出表…"); break;
+    case 10: label = QStringLiteral("正在扫描目标内存…"); break;
+    case 11: label = QStringLiteral("正在调用目标函数…"); break;
     default: return;
     }
     setBusy(true, label);
@@ -280,7 +440,18 @@ void StudioWindow::startJob(int kind, const QString &expr) {
     auto alive = m_alive;
     const QString pattern = pagePattern();
     const QString appId = m_appId->text().trimmed();
-    auto *job = new JobThread([this, kind, expr, pattern, appId, alive] {
+    // Memory-instrument inputs, snapshotted before the worker thread starts:
+    // 0=addr 1=len 2=writeBytes 3=module 4=scanPattern 5=scanStart 6=scanLen
+    // 7=callAddr 8..11=call args
+    const QStringList fxIn{
+        m_fxAddr->text().trimmed(),   m_fxLen->text().trimmed(),
+        m_fxWriteVal->text().trimmed(), m_fxModule->text().trimmed(),
+        m_fxPattern->text().trimmed(),  m_fxScanStart->text().trimmed(),
+        m_fxScanLen->text().trimmed(),  m_fxCallAddr->text().trimmed(),
+        m_fxArgs[0]->text().trimmed(),  m_fxArgs[1]->text().trimmed(),
+        m_fxArgs[2]->text().trimmed(),  m_fxArgs[3]->text().trimmed(),
+    };
+    auto *job = new JobThread([this, kind, expr, pattern, appId, alive, fxIn] {
         QStringList pages;
         if (kind == 0) {
             const bool ok = m_chan.ensure();
@@ -423,6 +594,184 @@ void StudioWindow::startJob(int kind, const QString &expr) {
                 m_log(QStringLiteral("离线解包完成：成功 %1 个，失败 %2 个")
                           .arg(okCount)
                           .arg(failCount));
+            }
+        } else if (kind >= 6 && kind <= 11) {
+            // Memory instrument: attach to the FzwyHook IPC inside the target
+            // WeChatAppEx host process, then run the requested op.
+            wmpf::FxInstrument fx;
+            QString err;
+            const quint32 pid = wmpf::pickMainHostPid();
+            bool attached = false;
+            if (!pid) {
+                err = QStringLiteral("当前没有 WeChatAppEx 主宿主进程（请先启动通道）");
+            } else {
+                // Try every loaded hook variant (newest hash suffix last): versions
+                // predating the instrument have no IPC objects, so keep falling
+                // through to the next variant on attach failure.
+                const QStringList names = wmpf::loadedHookDllNames(pid);
+                if (names.isEmpty()) {
+                    err = QStringLiteral("hook 未安装/仪器通道未建立，请先启动通道");
+                } else {
+                    for (int i = names.size() - 1; i >= 0 && !attached; --i) {
+                        QString base = names[i];
+                        const int dot = base.lastIndexOf(QLatin1Char('.'));
+                        if (dot > 0)
+                            base = base.left(dot);
+                        QString e2;
+                        if (fx.attach(pid, base, &e2))
+                            attached = true;
+                        else
+                            err = e2;
+                    }
+                    if (!attached)
+                        err = QStringLiteral("仪器通道未建立（%1）——hook 可能是旧版本，请重新启动通道")
+                                  .arg(err);
+                }
+            }
+            if (!attached) {
+                m_log(QStringLiteral("内存仪器连接失败：%1").arg(err));
+            } else if (kind == 6) {  // read
+                quint64 addr = 0, len = 0x100;
+                parseHex(fxIn[0], &addr);  // pre-validated in startJob
+                if (!fxIn[1].isEmpty() && !parseHex(fxIn[1], &len)) {
+                    m_log(QStringLiteral("长度格式不对：%1（hex，如 0x100）").arg(fxIn[1]));
+                } else if (len == 0 || len > 0x10000) {
+                    m_log(QStringLiteral("长度须在 1–0x10000 之间（当前 0x%1）").arg(len, 0, 16));
+                } else {
+                    QByteArray data;
+                    if (fx.read(addr, quint32(len), &data, &err)) {
+                        m_log(QStringLiteral("从 pid=%1 的 0x%2 读到 %3 字节：")
+                                  .arg(pid)
+                                  .arg(addr, 0, 16)
+                                  .arg(data.size()));
+                        const QStringList rows = hexDump(addr, data);
+                        for (const QString &r : rows)
+                            m_log(r);
+                    } else {
+                        m_log(QStringLiteral("读取失败：%1").arg(err));
+                    }
+                }
+            } else if (kind == 7) {  // write
+                quint64 addr = 0;
+                QByteArray bytes, mask;
+                if (!parseHex(fxIn[0], &addr)) {
+                    m_log(QStringLiteral("地址格式不对（hex，如 0x7FF612340000）"));
+                } else if (!parseHexPattern(fxIn[2], &bytes, &mask) || mask.contains('?')) {
+                    m_log(QStringLiteral("写入值格式不对（hex 字节串，不支持通配）"));
+                } else if (bytes.size() > 4096) {
+                    m_log(QStringLiteral("单次最多写 4096 字节（当前 %1）").arg(bytes.size()));
+                } else if (fx.write(addr, bytes, &err)) {
+                    m_log(QStringLiteral("已写入 %1 字节 → pid=%2 的 0x%3")
+                              .arg(bytes.size())
+                              .arg(pid)
+                              .arg(addr, 0, 16));
+                } else {
+                    m_log(QStringLiteral("写入失败：%1").arg(err));
+                }
+            } else if (kind == 8) {  // modules
+                QVector<wmpf::FxModuleInfo> mods;
+                if (fx.modules(&mods, &err)) {
+                    m_log(QStringLiteral("pid=%1 共 %2 个模块：").arg(pid).arg(mods.size()));
+                    for (const wmpf::FxModuleInfo &m : mods)
+                        m_log(QStringLiteral("  %1\t0x%2\t%3")
+                                  .arg(m.name)
+                                  .arg(m.base, 0, 16)
+                                  .arg(QLocale().formattedDataSize(qint64(m.size))));
+                } else {
+                    m_log(QStringLiteral("模块枚举失败：%1").arg(err));
+                }
+            } else if (kind == 9) {  // exports
+                quint64 base = 0;
+                const QString modName = fxIn[3];
+                if (!modName.isEmpty()) {
+                    QVector<wmpf::FxModuleInfo> mods;
+                    if (fx.modules(&mods, &err)) {
+                        for (const wmpf::FxModuleInfo &m : mods) {
+                            if (m.name.compare(modName, Qt::CaseInsensitive) == 0) {
+                                base = m.base;
+                                break;
+                            }
+                        }
+                        if (!base)
+                            m_log(QStringLiteral("目标进程里没有模块 %1，请先用模块列表确认名称")
+                                      .arg(modName));
+                    } else {
+                        m_log(QStringLiteral("模块枚举失败：%1").arg(err));
+                    }
+                }
+                if (base || modName.isEmpty()) {
+                    QVector<wmpf::FxExportInfo> exps;
+                    if (fx.exports(base, &exps, &err)) {
+                        m_log(QStringLiteral("共 %1 个导出（%2）：")
+                                  .arg(exps.size())
+                                  .arg(modName.isEmpty()
+                                           ? QStringLiteral("flue.dll，缺省回退到 hook DLL 自身")
+                                           : modName));
+                        const int show = qMin(200, int(exps.size()));
+                        for (int i = 0; i < show; ++i)
+                            m_log(QStringLiteral("  %1\t0x%2")
+                                      .arg(exps[i].name)
+                                      .arg(exps[i].addr, 0, 16));
+                        if (exps.size() > show)
+                            m_log(QStringLiteral("  … 其余 %1 项省略").arg(exps.size() - show));
+                    } else {
+                        m_log(QStringLiteral("导出解析失败：%1").arg(err));
+                    }
+                }
+            } else if (kind == 10) {  // scan
+                QByteArray pat, mask;
+                quint64 start = 0, len = 0;
+                if (!parseHexPattern(fxIn[4], &pat, &mask)) {
+                    m_log(QStringLiteral("模式格式不对（hex 串，?? 通配，如 4D 5A ?? 00）"));
+                } else if (pat.size() > 256) {
+                    m_log(QStringLiteral("模式最长 256 字节（当前 %1）").arg(pat.size()));
+                } else if (!fxIn[5].isEmpty() && !parseHex(fxIn[5], &start)) {
+                    m_log(QStringLiteral("起始地址格式不对：%1").arg(fxIn[5]));
+                } else if (!parseHex(fxIn[6], &len) || len == 0 || len > 0x4000000ull) {
+                    m_log(QStringLiteral("扫描长度须在 1–0x4000000 之间（hex）"));
+                } else {
+                    m_log(QStringLiteral("在 pid=%1 的 [0x%2, 0x%3) 扫描 %4 字节模式…")
+                              .arg(pid)
+                              .arg(start, 0, 16)
+                              .arg(start + len, 0, 16)
+                              .arg(pat.size()));
+                    quint64 hit = 0;
+                    if (fx.scan(start, len, pat, mask, &hit, &err)) {
+                        if (hit)
+                            m_log(QStringLiteral("命中：0x%1").arg(hit, 0, 16));
+                        else
+                            m_log(QStringLiteral("未命中（范围内没有找到该模式）"));
+                    } else {
+                        m_log(QStringLiteral("扫描失败：%1").arg(err));
+                    }
+                }
+            } else if (kind == 11) {  // call
+                quint64 fn = 0;
+                quint64 args[4] = {0, 0, 0, 0};
+                bool argsOk = true;
+                for (int i = 0; i < 4 && argsOk; ++i) {
+                    if (!fxIn[8 + i].isEmpty() && !parseHex(fxIn[8 + i], &args[i]))
+                        argsOk = false;
+                }
+                if (!parseHex(fxIn[7], &fn)) {
+                    m_log(QStringLiteral("函数地址格式不对（hex）"));
+                } else if (!argsOk) {
+                    m_log(QStringLiteral("参数格式不对（hex，可空）"));
+                } else {
+                    m_log(QStringLiteral("调用 0x%1(%2, %3, %4, %5)…")
+                              .arg(fn, 0, 16)
+                              .arg(args[0], 0, 16)
+                              .arg(args[1], 0, 16)
+                              .arg(args[2], 0, 16)
+                              .arg(args[3], 0, 16));
+                    quint64 ret = 0;
+                    if (fx.callAddr(fn, args[0], args[1], args[2], args[3], &ret, &err))
+                        m_log(QStringLiteral("返回 0x%1（十进制 %2）")
+                                  .arg(ret, 0, 16)
+                                  .arg(ret));
+                    else
+                        m_log(QStringLiteral("调用失败：%1").arg(err));
+                }
             }
         }
         const QString doneLabel = kind == 0 ? QStringLiteral("通道运行中") : QStringLiteral("就绪");

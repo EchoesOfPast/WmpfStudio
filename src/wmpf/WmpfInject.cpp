@@ -114,8 +114,6 @@ QString modulePathOf(quint32 pid) {
     return out;
 }
 
-QStringList loadedHookDllNames(quint32 pid);  // defined below
-
 // Write FzwyHook.cfg (the hook DLL reads it from its own directory).
 // hooks= lists only hooks actually enabled: cdpFilter is disabled wholesale in the DLL
 // due to the CET shadow stack (see FzwyHook.cpp header); including it would just earn a
@@ -321,30 +319,6 @@ bool restorePrologue(quint32 pid, quint64 moduleBase, const QString &modulePath,
     return ok;
 }
 
-// All loaded hook DLL names in the target process.
-// Note the emphasis on "all": during an upgrade, multiple variants may be loaded sequentially
-// in the same process; taking only the first would get the old version, and commanding the old
-// version to unhook would also wipe the new version's hook — all variants share the same
-// target entry bytes (verified the hard way).
-QStringList loadedHookDllNames(quint32 pid) {
-    QStringList found;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE)
-        return found;
-    MODULEENTRY32W me{};
-    me.dwSize = sizeof(me);
-    if (Module32FirstW(snap, &me)) {
-        do {
-            const QString n = QString::fromWCharArray(me.szModule);
-            if (n.startsWith(QStringLiteral("FzwyHook"), Qt::CaseInsensitive) &&
-                n.endsWith(QStringLiteral(".dll"), Qt::CaseInsensitive))
-                found.append(n);
-        } while (Module32NextW(snap, &me));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
 // The command event name includes the DLL file name: multiple versions may be loaded
 // sequentially in the same process; we must be able to command a specific one precisely
 // (an auto-reset event would be grabbed by a random waiting thread otherwise).
@@ -379,6 +353,42 @@ bool triggerUnhook(quint32 pid, const QString &dllFileName) {
 #endif  // _WIN32
 
 }  // namespace
+
+quint32 pickMainHostPid() {
+#ifdef _WIN32
+    return pickMainProcess(listWeChatAppEx());
+#else
+    return 0;
+#endif
+}
+
+// All loaded hook DLL names in the target process.
+// Note the emphasis on "all": during an upgrade, multiple variants may be loaded sequentially
+// in the same process; taking only the first would get the old version, and commanding the old
+// version to unhook would also wipe the new version's hook — all variants share the same
+// target entry bytes (verified the hard way).
+QStringList loadedHookDllNames(quint32 pid) {
+    QStringList found;
+#ifdef _WIN32
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE)
+        return found;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            const QString n = QString::fromWCharArray(me.szModule);
+            if (n.startsWith(QStringLiteral("FzwyHook"), Qt::CaseInsensitive) &&
+                n.endsWith(QStringLiteral(".dll"), Qt::CaseInsensitive))
+                found.append(n);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+#else
+    Q_UNUSED(pid);
+#endif
+    return found;
+}
 
 QString hookDllPath() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/FzwyHook.dll");

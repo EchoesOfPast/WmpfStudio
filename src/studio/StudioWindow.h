@@ -32,7 +32,8 @@ private:
     void buildUi();
     void setBusy(bool busy, const QString &label);
     // kind: 0=start channel, 1=refresh pages, 2=eval, 3=export storage,
-    //       4=scan local packages, 5=decrypt+unpack all
+    //       4=scan local packages, 5=decrypt+unpack all,
+    //       6=fx read, 7=fx write, 8=fx modules, 9=fx exports, 10=fx scan, 11=fx call
     void startJob(int kind, const QString &expr = {});
     QString pagePattern() const;
 
@@ -55,4 +56,21 @@ private:
     QLineEdit *m_appId = nullptr;
     QPushButton *m_btnScan = nullptr;
     QPushButton *m_btnUnpack = nullptr;
+
+    // Memory instrument card (talks to FzwyHook.dll inside the target process)
+    QLineEdit *m_fxAddr = nullptr;
+    QLineEdit *m_fxLen = nullptr;
+    QLineEdit *m_fxWriteVal = nullptr;
+    QLineEdit *m_fxModule = nullptr;
+    QLineEdit *m_fxPattern = nullptr;
+    QLineEdit *m_fxScanStart = nullptr;
+    QLineEdit *m_fxScanLen = nullptr;
+    QLineEdit *m_fxCallAddr = nullptr;
+    QLineEdit *m_fxArgs[4] = {};
+    QPushButton *m_btnFxRead = nullptr;
+    QPushButton *m_btnFxWrite = nullptr;
+    QPushButton *m_btnFxModules = nullptr;
+    QPushButton *m_btnFxExports = nullptr;
+    QPushButton *m_btnFxScan = nullptr;
+    QPushButton *m_btnFxCall = nullptr;
 };
