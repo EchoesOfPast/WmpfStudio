@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-set(FZWY_VERSION "0.2.0" CACHE STRING "App version")
+set(FZWY_VERSION "0.3.0" CACHE STRING "App version")
 project(WmpfStudio VERSION ${FZWY_VERSION} LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
